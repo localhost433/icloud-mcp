@@ -1,0 +1,6 @@
+fastmcp>=2.0
+caldav>=2.0.1
+icalendar>=6.0
+lxml>=5.0
+python-dotenv>=1.0
+
