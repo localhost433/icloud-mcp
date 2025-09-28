@@ -102,10 +102,11 @@ curl http://127.0.0.1:8000/health
 ## Quick Start (Docker)
 
 ```bash
+# Run with env vars
 docker build -t icloud-mcp .
 
-# Run with env vars
-Optional: mount a local `.env` instead of passing vars.
+# Optional: mount a local `.env` instead of passing vars.
+docker run -it --rm \
   -e APPLE_ID=you@example.com \
   -e ICLOUD_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx \
   -e TZID=America/New_York \
