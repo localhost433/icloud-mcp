@@ -6,6 +6,12 @@ An HTTP **Model Context Protocol (MCP)** server exposing iCloud Calendar (CalDAV
 
 ---
 
+## Why did I build this?
+
+I built this to use in ChatGPT Custom Connector, so I can change my iCloud Calendar compared to changing it manually. Came up with this idea on a Friday night before a TOP Pset was due, and this turned out to be a fun 1-day project.
+
+---
+
 ## Features
 
 - HTTP MCP server (`/mcp`) + `GET /health`
@@ -40,7 +46,11 @@ CALDAV_URL=https://caldav.icloud.com     # optional, default shown
 HOST=127.0.0.1                           # optional
 PORT=8000                                # optional
 TZID=America/New_York                    # default TZ for new/edited events
-````
+
+# Deep Research: read-only profile (optional)
+DR_PROFILE=0                             # Set to 1 to enable DR mode (default 0)
+SCAN_DAYS=1095                           # Time window (days) scanned by DR search/fetch (default ~3 years)
+```
 
 Required: `APPLE_ID`, `ICLOUD_APP_PASSWORD`.
 
@@ -114,6 +124,24 @@ Deletes the first matching `uid` in a ±3-year window.
 * Accepts naive or `Z`/offset datetimes (`YYYY-MM-DDTHH:MM:SS`, optionally `Z` or `-04:00` etc.)
 * New/edited events emit `DTSTART;TZID=...` and `DTEND;TZID=...` using provided `tzid` or `TZID` env
 * Updates attempt to reuse the original TZID when present
+
+---
+
+## Deep Research read-only mode
+
+Set DR_PROFILE=1 to run a read-only tool set for Deep Research. This exposes only:
+- search(query) -> [{ id, title, snippet }]
+- fetch(ids) -> [{ id, mimeType: 'text/calendar', content }]
+
+Example:
+```bash
+DR_PROFILE=1 HOST=127.0.0.1 PORT=8000 python server.py
+```
+
+Notes:
+- Write tools (list_events/create_event/update_event/delete_event) are disabled in this mode.
+- SCAN_DAYS controls the search window around “now” (default: 1095 days ≈ 3 years).
+- Keep this service private or add auth
 
 ---
 
@@ -199,6 +227,4 @@ MIT License.
 
 ---
 
-## Why did I build this?
-
-Happy scheduling, I hope this helps! I built this to use in ChatGPT Custom Connector, so I can change my iCloud Calendar compared to changing it manually. Came up with this idea on a Friday night before a TOP Pset was due, and this turned out to be a fun 1-day project.
+Happy scheduling, I hope this helps!
