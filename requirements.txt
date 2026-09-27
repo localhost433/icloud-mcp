@@ -1,6 +1,6 @@
 fastmcp>=2.0
-caldav>=2.0.1
+caldav>=3.0
 icalendar>=6.0
+recurring-ical-events>=3.0
 lxml>=5.0
 python-dotenv>=1.0
-

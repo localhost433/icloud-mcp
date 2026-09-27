@@ -4,14 +4,17 @@
 from __future__ import annotations
 
 import os
+import argparse
 import logging
 import datetime as dt
 from pathlib import Path
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Union
 from zoneinfo import ZoneInfo
 
+import recurring_ical_events
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from icalendar import Calendar as ICalendar, Event as IEvent, vRecur
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
@@ -37,14 +40,15 @@ CALDAV_URL: str  = _require_env("CALDAV_URL", "https://caldav.icloud.com")
 DEFAULT_TZID: str = os.environ.get("TZID", "America/New_York").strip()
 
 LOOKBACK_YEARS = 3  # for UID searches
+DESCRIPTION_LIMIT = 500  # chars of DESCRIPTION returned by list_events
 SERVER_HOST = os.environ.get("HOST", "127.0.0.1")
 SERVER_PORT = int(os.environ.get("PORT", "8000"))
 
-# Add DR profile + scan window
+# Deep Research (read-only) profile
 DR_ONLY = os.environ.get("DR_PROFILE", "0") == "1"
 SCAN_DAYS = int(os.environ.get("SCAN_DAYS", str(LOOKBACK_YEARS * 365)))
 
-# Optional: simple logging
+# Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
@@ -62,9 +66,11 @@ async def health(_: Request) -> PlainTextResponse:
 
 # CalDAV helpers
 
+DateOrDateTime = Union[dt.date, dt.datetime]
+
 
 def _client() -> DAVClient:
-    """Return a new stateless DAV client."""
+    """Return a new DAV client."""
     return DAVClient(url=CALDAV_URL, username=APPLE_ID, password=APP_PW)
 
 
@@ -78,13 +84,38 @@ def _all_calendars():
     return _principal().calendars()
 
 
+def _cal_name(calendar) -> Optional[str]:
+    """Display name of a calendar."""
+    return calendar.get_display_name()
+
+
 def _resolve_calendar(name_or_url: str):
     """Return a caldav.Calendar from a display name or absolute URL."""
     for calendar in _all_calendars():
-        if calendar.name == name_or_url or str(calendar.url) == name_or_url:
+        if _cal_name(calendar) == name_or_url or str(calendar.url) == name_or_url:
             return calendar
     # Fallback: instantiate by URL directly
     return _client().calendar(url=name_or_url)
+
+
+def _find_event(calendar, uid: str):
+    """Return the object holding ``uid`` in ``calendar``, or None.
+
+    Falls back to scanning LOOKBACK_YEARS either side of today if the
+    server rejects the UID query.
+    """
+    try:
+        return calendar.event_by_uid(uid)
+    except dav_error.NotFoundError:
+        return None
+    except dav_error.DAVError as exc:
+        log.warning("UID lookup failed on %s (%s); scanning instead", _cal_name(calendar), exc)
+
+    start, end = _uid_search_window()
+    for ev in calendar.search(event=True, start=start, end=end, expand=False):
+        if str(ev.component.get("uid", "")) == uid:
+            return ev
+    return None
 
 def _parse_iso(s: str) -> dt.datetime:
     """
@@ -93,6 +124,19 @@ def _parse_iso(s: str) -> dt.datetime:
     if s.endswith("Z"):
         return dt.datetime.fromisoformat(s[:-1]).replace(tzinfo=dt.timezone.utc)
     return dt.datetime.fromisoformat(s)
+
+
+def _parse_when(s: str) -> DateOrDateTime:
+    """Like ``_parse_iso``, but a bare 'YYYY-MM-DD' becomes a date (all-day)."""
+    s = s.strip()
+    if len(s) == 10:
+        return dt.date.fromisoformat(s)
+    return _parse_iso(s)
+
+
+def _is_all_day(value: DateOrDateTime) -> bool:
+    """True for a plain date (all-day), False for a datetime."""
+    return not isinstance(value, dt.datetime)
 
 
 def _scan_window() -> tuple[dt.datetime, dt.datetime]:
@@ -109,49 +153,9 @@ def _uid_search_window() -> tuple[dt.datetime, dt.datetime]:
     delta = dt.timedelta(days=365 * LOOKBACK_YEARS)
     return now - delta, now + delta
 
-def _fmt(ts: dt.datetime) -> str:
-    """Format as 'YYYYMMDDTHHMMSS' for ICS."""
-    return ts.strftime("%Y%m%dT%H%M%S")
-
-def _fmt_utc(ts: dt.datetime) -> str:
-    """Format as 'YYYYMMDDTHHMMSSZ' in UTC for ICS."""
-    # If naive, assume default TZ, then convert to UTC
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=ZoneInfo(DEFAULT_TZID))
-    ts_utc = ts.astimezone(dt.timezone.utc)
-    return ts_utc.strftime("%Y%m%dT%H%M%SZ")
-
-def _ics_escape(text: str) -> str:
-    """Minimal ICS escaping for SUMMARY/DESCRIPTION."""
-    return (
-        text.replace("\\", "\\\\")
-            .replace("\n", "\\n")
-            .replace(",", "\\,")
-            .replace(";", "\\;")
-    )
-
 def _to_iso(o) -> Optional[str]:
-    """Best-effort ISO formatter for date/time values."""
-    if o is None:
-        return None
-    if isinstance(o, dt.datetime):
-        return o.isoformat()
-    try:
-        return o.isoformat()
-    except Exception:
-        return str(o)
-
-
-def _parse_iso_or_default(value: Optional[str], fallback: dt.datetime) -> dt.datetime:
-    """Parse an ISO datetime string or return the fallback if missing.
-
-    This mirrors ``_parse_iso`` semantics but handles ``None`` by
-    returning ``fallback``. Non-empty strings that fail to parse will
-    still raise, preserving the original behavior.
-    """
-    if value is None:
-        return fallback
-    return _parse_iso(value)
+    """ISO string for a date/datetime; None stays None."""
+    return o.isoformat() if o is not None else None
 
 
 def _normalize_to_tz(ts: dt.datetime, tzid: str) -> dt.datetime:
@@ -166,48 +170,233 @@ def _normalize_to_tz(ts: dt.datetime, tzid: str) -> dt.datetime:
     return ts.astimezone(tz)
 
 
+def _to_local(value: DateOrDateTime) -> DateOrDateTime:
+    """Express aware datetimes in DEFAULT_TZID; dates and floating times are unchanged."""
+    if isinstance(value, dt.datetime) and value.tzinfo is not None:
+        return value.astimezone(ZoneInfo(DEFAULT_TZID))
+    return value
+
+
+def _sort_key(value: DateOrDateTime) -> dt.datetime:
+    """Comparable instant for a date, floating datetime or aware datetime."""
+    if _is_all_day(value):
+        return dt.datetime.combine(value, dt.time(), ZoneInfo(DEFAULT_TZID))
+    if value.tzinfo is None:
+        return value.replace(tzinfo=ZoneInfo(DEFAULT_TZID))
+    return value
+
+
+def _local_day(value: DateOrDateTime) -> dt.date:
+    """Calendar day of a date/datetime in DEFAULT_TZID."""
+    return value if _is_all_day(value) else _sort_key(value).astimezone(ZoneInfo(DEFAULT_TZID)).date()
+
+
+def _occurrence_matches(start: DateOrDateTime, wanted: DateOrDateTime) -> bool:
+    """A bare date matches any occurrence that day; otherwise the starts must be equal."""
+    if _is_all_day(start) != _is_all_day(wanted):
+        return _local_day(start) == _local_day(wanted)
+    return _sort_key(start) == _sort_key(wanted)
+
+
+def _same_kind(template: DateOrDateTime, value: DateOrDateTime) -> DateOrDateTime:
+    """Convert ``value`` to the kind of ``template``: date, floating time, or time in its zone."""
+    if _is_all_day(template):
+        return value if _is_all_day(value) else _to_local(value).date()
+    if template.tzinfo is None:
+        return _to_local(value).replace(tzinfo=None) if value.tzinfo else value
+    return value.astimezone(template.tzinfo) if value.tzinfo else value.replace(tzinfo=template.tzinfo)
+
+
+def _coerce_span(start: DateOrDateTime, end: DateOrDateTime, tzid: str) -> tuple:
+    """Validate a start/end pair: both dates (all-day) or both datetimes in ``tzid``."""
+    if _is_all_day(start) != _is_all_day(end):
+        raise ValueError("start and end must both be dates (all-day) or both be datetimes")
+    if _is_all_day(start):
+        if end == start:
+            end = start + dt.timedelta(days=1)  # start == end on a date means that one day
+    else:
+        start, end = _normalize_to_tz(start, tzid), _normalize_to_tz(end, tzid)
+    if end <= start:
+        raise ValueError("end must be after start (end is exclusive)")
+    return start, end
+
+
+def _text(comp, name: str) -> str:
+    """Return a text property as str ('' if absent)."""
+    value = comp.get(name)
+    return str(value) if value is not None else ""
+
+
+def _set_text(comp, name: str, value: str) -> None:
+    """Replace a text property; an empty string removes it."""
+    comp.pop(name, None)
+    if value:
+        comp.add(name, value)
+
+
+def _event_end(comp) -> Optional[DateOrDateTime]:
+    """Return DTEND, or DTSTART + DURATION, or None."""
+    if comp.get("DTEND") is not None:
+        return comp.decoded("DTEND")
+    if comp.get("DURATION") is not None:
+        return comp.decoded("DTSTART") + comp.decoded("DURATION")
+    return None
+
+
+def _event_row(comp, calendar_name: str, raw: Optional[str] = None) -> Dict[str, Any]:
+    """Row returned by list_events for one VEVENT or expanded occurrence."""
+    start = comp.decoded("dtstart")
+    end = _event_end(comp)
+    description = _text(comp, "DESCRIPTION")
+    if len(description) > DESCRIPTION_LIMIT:
+        description = description[:DESCRIPTION_LIMIT] + "..."
+    row: Dict[str, Any] = {
+        "uid": _text(comp, "UID"),
+        "summary": _text(comp, "SUMMARY"),
+        "start": _to_iso(_to_local(start)),
+        "end": _to_iso(_to_local(end)),
+        "all_day": _is_all_day(start),
+        "location": _text(comp, "LOCATION") or None,
+        "description": description or None,
+        "calendar": calendar_name,
+        "recurring": comp.get("RECURRENCE-ID") is not None or comp.get("RRULE") is not None,
+    }
+    if raw is not None:
+        row["raw"] = raw
+    return row
+
+
+def _master_vevent(ical, uid: str):
+    """Return the series VEVENT for ``uid`` (the one without RECURRENCE-ID)."""
+    events = [c for c in ical.walk("VEVENT") if _text(c, "UID") == uid] or list(ical.walk("VEVENT"))
+    for comp in events:
+        if comp.get("RECURRENCE-ID") is None:
+            return comp
+    return events[0]
+
+
+def _exdates(comp) -> List[DateOrDateTime]:
+    """Return all EXDATE values of a component."""
+    prop = comp.get("EXDATE")
+    if prop is None:
+        return []
+    props = prop if isinstance(prop, list) else [prop]
+    return [d.dt for p in props for d in p.dts]
+
+
+def _drop_overrides(ical, uid: str, recurrence_id: Optional[DateOrDateTime] = None) -> None:
+    """Remove modified occurrences of ``uid``: all of them, or the one at ``recurrence_id``."""
+    keep = []
+    for comp in ical.subcomponents:
+        is_override = comp.name == "VEVENT" and _text(comp, "UID") == uid and comp.get("RECURRENCE-ID") is not None
+        if is_override and (
+            recurrence_id is None or _sort_key(comp.decoded("RECURRENCE-ID")) == _sort_key(recurrence_id)
+        ):
+            continue
+        keep.append(comp)
+    ical.subcomponents[:] = keep
+
+
+def _shift_exceptions(ical, master, delta: dt.timedelta) -> None:
+    """Move EXDATEs and RECURRENCE-IDs with the series so they still line up."""
+    exdates = _exdates(master)
+    master.pop("EXDATE", None)
+    for value in exdates:
+        master.add("EXDATE", value + delta)
+    uid = _text(master, "UID")
+    for comp in ical.walk("VEVENT"):
+        if comp is not master and _text(comp, "UID") == uid and comp.get("RECURRENCE-ID") is not None:
+            rid = comp.decoded("RECURRENCE-ID")
+            comp.pop("RECURRENCE-ID")
+            comp.add("RECURRENCE-ID", rid + delta)
+
+
+def _reschedule(ical, master, start: Optional[str], end: Optional[str], tzid: str) -> None:
+    """Apply new start/end to the series; with only ``start``, keep the duration."""
+    old_start = master.decoded("DTSTART")
+    old_end = _event_end(master)
+
+    new_start = _parse_when(start) if start is not None else old_start
+    if end is not None:
+        new_end = _parse_when(end)
+    elif old_end is not None and _is_all_day(new_start) == _is_all_day(old_start):
+        new_end = new_start + (old_end - old_start)
+    else:
+        new_end = new_start + (dt.timedelta(days=1) if _is_all_day(new_start) else dt.timedelta(hours=1))
+    new_start, new_end = _coerce_span(new_start, new_end, tzid)
+
+    if _is_all_day(new_start) == _is_all_day(old_start):
+        old_ref = old_start if _is_all_day(old_start) else _normalize_to_tz(old_start, tzid)
+        delta = new_start - old_ref
+        if delta:
+            _shift_exceptions(ical, master, delta)
+
+    for name in ("DTSTART", "DTEND", "DURATION"):
+        master.pop(name, None)
+    master.add("DTSTART", new_start)
+    master.add("DTEND", new_end)
+
+
+def _find_occurrence(ical, uid: str, wanted: DateOrDateTime) -> Optional[DateOrDateTime]:
+    """RECURRENCE-ID (original start) of the occurrence of ``uid`` at ``wanted``, or None."""
+    anchor = _sort_key(wanted)
+    for inst in recurring_ical_events.of(ical).between(anchor - dt.timedelta(days=1), anchor + dt.timedelta(days=2)):
+        if _text(inst, "UID") != uid or not _occurrence_matches(inst.decoded("DTSTART"), wanted):
+            continue
+        if inst.get("RECURRENCE-ID") is not None:
+            return inst.decoded("RECURRENCE-ID")
+        return inst.decoded("DTSTART")
+    return None
+
+
+def _touch(comp) -> None:
+    """Refresh timestamps (caldav's save() bumps an existing SEQUENCE)."""
+    now = dt.datetime.now(dt.timezone.utc)
+    for name in ("DTSTAMP", "LAST-MODIFIED"):
+        comp.pop(name, None)
+    comp.add("DTSTAMP", now)
+    comp.add("LAST-MODIFIED", now)
+
+
+def _save(target, ical) -> None:
+    """Write an edited calendar object back to the server."""
+    target.data = ical.to_ical().decode()
+    target.save()
+
+
 def _build_vevent_ics(
     uid: str,
     summary: str,
-    start: dt.datetime,
-    end: dt.datetime,
-    tzid: str,
+    start: DateOrDateTime,
+    end: DateOrDateTime,
     description: Optional[str],
     location: Optional[str],
     rrule: Optional[str],
-    *,
-    include_location: bool,
 ) -> str:
-    """Build a minimal VEVENT ICS blob.
-
-    The resulting text matches the layout used by ``create_event`` and
-    ``update_event`` so existing behavior is preserved.
-    """
-    lines: List[str] = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//ChatGPT MCP iCloud CalDAV//EN",
-        "BEGIN:VEVENT",
-        f"UID:{uid}",
-        f"SUMMARY:{_ics_escape(summary)}",
-        f"DTSTART;TZID={tzid}:{_fmt(start)}",
-        f"DTEND;TZID={tzid}:{_fmt(end)}",
-    ]
-
-    if include_location and location is not None and location != "":
-        lines.append(f"LOCATION:{_ics_escape(location)}")
+    """Build a single-VEVENT ICS blob. Date start/end produce an all-day event."""
+    event = IEvent()
+    event.add("UID", uid)
+    event.add("DTSTAMP", dt.datetime.now(dt.timezone.utc))
+    event.add("SUMMARY", summary)
+    event.add("DTSTART", start)
+    event.add("DTEND", end)
+    if location:
+        event.add("LOCATION", location)
     if description:
-        lines.append(f"DESCRIPTION:{_ics_escape(description)}")
+        event.add("DESCRIPTION", description)
     if rrule:
-        lines.append(f"RRULE:{rrule}")
+        event.add("RRULE", vRecur.from_ical(rrule))
 
-    lines += ["END:VEVENT", "END:VCALENDAR"]
-    return "\n".join(lines)
+    cal = ICalendar()
+    cal.add("PRODID", "-//icloud-mcp//EN")
+    cal.add("VERSION", "2.0")
+    cal.add_component(event)
+    return cal.to_ical().decode()
 
 def _build_rrule(
     recurrence: Optional[Dict[str, Any]],
     tzid: str,
-    dtstart: Optional[dt.datetime] = None,
+    dtstart: Optional[DateOrDateTime] = None,
 ) -> Optional[str]:
     """
     Build an RFC5545 RRULE value from a high-level recurrence dict.
@@ -282,11 +471,15 @@ def _build_rrule(
                     local_dt = dt.datetime(y, m, d, 23, 59, 59)
                 else:
                     local_dt = dt.datetime.fromisoformat(date_str)
-                if local_dt.tzinfo is None:
-                    local_dt = local_dt.replace(tzinfo=ZoneInfo(tzid))
-                until_utc = local_dt.astimezone(dt.timezone.utc)
-                until_str = until_utc.strftime("%Y%m%dT%H%M%SZ")
-                parts.append(f"UNTIL={until_str}")
+                if dtstart is not None and _is_all_day(dtstart):
+                    # RFC 5545: UNTIL must be a DATE when DTSTART is a DATE
+                    parts.append(f"UNTIL={local_dt.strftime('%Y%m%d')}")
+                else:
+                    if local_dt.tzinfo is None:
+                        local_dt = local_dt.replace(tzinfo=ZoneInfo(tzid))
+                    until_utc = local_dt.astimezone(dt.timezone.utc)
+                    until_str = until_utc.strftime("%Y%m%dT%H%M%SZ")
+                    parts.append(f"UNTIL={until_str}")
             except Exception:
                 # If parsing fails, skip UNTIL
                 pass
@@ -296,6 +489,21 @@ def _build_rrule(
             parts.append(f"COUNT={count}")
 
     return ";".join(parts) if parts else None
+
+
+def _require_rrule(
+    recurrence: Dict[str, Any],
+    tzid: str,
+    dtstart: DateOrDateTime,
+) -> str:
+    """Like ``_build_rrule``, but raise on a recurrence it can't turn into an RRULE."""
+    rrule = _build_rrule(recurrence, tzid=tzid, dtstart=dtstart)
+    if not rrule:
+        raise ValueError(
+            "Unrecognized recurrence: need frequency daily|weekly|monthly|yearly, "
+            "or frequency 'custom' with an 'rrule' string"
+        )
+    return rrule
 
 # DR profile: read-only search/fetch
 if DR_ONLY:
@@ -317,7 +525,7 @@ if DR_ONLY:
 
         rows: List[Dict[str, Any]] = []
         for cal in _all_calendars():
-            calname = getattr(cal, "name", None) or str(cal.url)
+            calname = _cal_name(cal) or str(cal.url)
             # expand=True to surface recurring instances as separate hits
             for ev in cal.search(event=True, start=start, end=end, expand=True):
                 comp = ev.component
@@ -331,7 +539,7 @@ if DR_ONLY:
                     rows.append({
                         "id": f"{str(cal.url)}|{uid}",
                         "title": summary[:200],
-                        "snippet": f"{when} — {calname}",
+                        "snippet": f"{when} - {calname}",
                     })
         return rows[:200]
 
@@ -382,7 +590,7 @@ if not DR_ONLY:
         for calendar in calendars:
             out.append(
                 {
-                    "name": getattr(calendar, "name", None),
+                    "name": _cal_name(calendar),
                     "url": str(calendar.url),
                     "id": getattr(calendar, "id", None),
                 }
@@ -417,50 +625,65 @@ if not DR_ONLY:
                 if has_event:
                     out.append(
                         {
-                            "name": getattr(calendar, "name", None),
+                            "name": _cal_name(calendar),
                             "url": str(calendar.url),
                             "id": getattr(calendar, "id", None),
                         }
                     )
             except dav_error.DAVError as exc:
-                log.warning("CalDAV search failed for calendar %s: %s", getattr(calendar, "name", calendar), exc)
+                log.warning("CalDAV search failed for calendar %s: %s", _cal_name(calendar), exc)
             except Exception:
-                log.exception("Unexpected error while scanning calendar %r for events", getattr(calendar, "name", calendar))
+                log.exception("Unexpected error while scanning calendar %r for events", _cal_name(calendar))
 
         return out
 
     @mcp.tool()
     def list_events(
-        calendar_name_or_url: str,
         start: str,
         end: str,
+        calendar_name_or_url: Optional[str] = None,
         expand_recurring: bool = True,
+        query: Optional[str] = None,
+        include_raw: bool = False,
     ) -> List[Dict[str, Any]]:
         """
-        List events between ISO datetimes [start, end).
-        calendar_name_or_url: either display name or absolute CalDAV URL.
+        List events between ISO datetimes [start, end), sorted by start.
+
+        calendar_name_or_url: display name or CalDAV URL; omit to search all calendars.
+        query: optional case-insensitive filter on summary, location and description.
+        include_raw: also return each event's ICS text (large; off by default).
+
+        Times come back in the server's TZID. All-day events have all_day=true
+        and date-only start/end (end is exclusive). For recurring events each
+        occurrence is its own row sharing the series uid; pass its start as
+        delete_event(occurrence_start=...) to remove just that occurrence.
         """
-        s = _parse_iso(start)
-        e = _parse_iso(end)
-        cal = _resolve_calendar(calendar_name_or_url)
+        s = _normalize_to_tz(_parse_iso(start), DEFAULT_TZID)
+        e = _normalize_to_tz(_parse_iso(end), DEFAULT_TZID)
+        needle = (query or "").strip().lower()
+        calendars = [_resolve_calendar(calendar_name_or_url)] if calendar_name_or_url else _all_calendars()
 
-        events = cal.search(event=True, start=s, end=e, expand=expand_recurring)
-        out: List[Dict[str, Any]] = []
-        for ev in events:
-            comp = ev.component  # icalendar.Event
-            summary = str(comp.get("summary", "")) if comp.get("summary") is not None else ""
-            dtstart = comp.decoded("dtstart")
-            dtend   = comp.decoded("dtend", default=None)
-            uid     = str(comp.get("uid", "")) if comp.get("uid") is not None else ""
+        rows: List[tuple] = []
+        for calendar in calendars:
+            calname = _cal_name(calendar) or str(calendar.url)
+            try:
+                events = calendar.search(event=True, start=s, end=e, expand=expand_recurring)
+            except dav_error.DAVError as exc:
+                if calendar_name_or_url:
+                    raise
+                log.warning("CalDAV search failed for calendar %s: %s", calname, exc)
+                continue
+            for ev in events:
+                comp = ev.component  # icalendar.Event
+                if needle:
+                    haystack = " ".join(_text(comp, k) for k in ("SUMMARY", "LOCATION", "DESCRIPTION")).lower()
+                    if needle not in haystack:
+                        continue
+                row = _event_row(comp, calname, raw=ev.data if include_raw else None)
+                rows.append((_sort_key(comp.decoded("dtstart")), row))
 
-            out.append({
-                "uid": uid,
-                "summary": summary,
-                "start": dtstart.isoformat() if hasattr(dtstart, "isoformat") else str(dtstart),
-                "end":   dtend.isoformat() if (dtend and hasattr(dtend, "isoformat")) else (str(dtend) if dtend else None),
-                "raw": ev.data,  # original ICS text
-            })
-        return out
+        rows.sort(key=lambda pair: pair[0])
+        return [row for _, row in rows]
 
     @mcp.tool()
     def create_event(
@@ -476,7 +699,9 @@ if not DR_ONLY:
         """
         Create an event in the given calendar.
 
-        start/end: ISO datetimes, local or '...Z' for UTC.
+        start/end: ISO datetimes, local or '...Z' for UTC. For an all-day
+                  event pass dates ('YYYY-MM-DD'); end is exclusive, so a
+                  single day is start=D, end=D+1.
         tzid:     IANA TZ name (e.g., 'America/New_York'); used if times are naive.
         recurrence: optional dict, e.g.:
 
@@ -498,24 +723,21 @@ if not DR_ONLY:
         """
         tzid = tzid or DEFAULT_TZID
 
-        s = _normalize_to_tz(_parse_iso(start), tzid)
-        e = _normalize_to_tz(_parse_iso(end), tzid)
+        s, e = _coerce_span(_parse_when(start), _parse_when(end), tzid)
+        rrule = _require_rrule(recurrence, tzid=tzid, dtstart=s) if recurrence else None
 
         cal = _resolve_calendar(calendar_name_or_url)
 
-        uid = os.urandom(16).hex() + "@chatgpt-mcp"
-        rrule = _build_rrule(recurrence, tzid=tzid, dtstart=s)
+        uid = os.urandom(16).hex() + "@icloud-mcp"
 
         ics_text = _build_vevent_ics(
             uid=uid,
             summary=summary,
             start=s,
             end=e,
-            tzid=tzid,
             description=description,
             location=location,
             rrule=rrule,
-            include_location=bool(location),
         )
 
         cal.save_event(ics_text)
@@ -526,8 +748,8 @@ if not DR_ONLY:
         calendar_name_or_url: str,
         uid: str,
         summary: Optional[str] = None,
-        start: Optional[str] = None,   # ISO datetime
-        end: Optional[str] = None,     # ISO datetime
+        start: Optional[str] = None,   # ISO datetime, or date for all-day
+        end: Optional[str] = None,     # ISO datetime, or date for all-day
         tzid: Optional[str] = None,
         description: Optional[str] = None,
         location: Optional[str] = None,
@@ -535,105 +757,109 @@ if not DR_ONLY:
         clear_recurrence: bool = False,
     ) -> bool:
         """
-        Update a VEVENT identified by UID.
+        Update the event identified by UID. Edits it in place, so alarms,
+        attendees, exceptions and other fields are kept.
 
-        - If recurrence is provided, replaces existing RRULE.
-        - If clear_recurrence is True, removes any RRULE.
-        - If neither is provided, preserves existing RRULE.
+        - For recurring events this changes the whole series; its EXDATEs and
+          moved occurrences shift along when the start moves.
+        - Only start given: the event keeps its duration.
+        - description/location: omit to keep, "" to clear.
+        - recurrence replaces the RRULE (same shape as create_event).
+        - clear_recurrence=True removes the RRULE and all exceptions; it wins
+          over recurrence.
+        Returns False if the UID is not found.
         """
         tzid = tzid or DEFAULT_TZID
 
         cal = _resolve_calendar(calendar_name_or_url)
-
-        # Search wide window for matching UID
-        s_window, e_window = _uid_search_window()
-
-        target = None
-        for ev in cal.search(event=True, start=s_window, end=e_window, expand=False):
-            comp = ev.component
-            if str(comp.get("uid", "")) == uid:
-                target = ev
-                break
+        target = _find_event(cal, uid)
         if target is None:
             return False
 
-        comp = target.component
-        old_summary = str(comp.get("summary", "")) if comp.get("summary") is not None else ""
-        old_desc    = str(comp.get("description", "")) if comp.get("description") is not None else ""
-        old_loc     = str(comp.get("location", "")) if comp.get("location") is not None else ""
-        old_dtstart = comp.decoded("dtstart")
-        old_dtend   = comp.decoded("dtend", default=None)
+        ical = ICalendar.from_ical(target.data)
+        master = _master_vevent(ical, uid)
 
-        # Existing RRULE, if any
-        old_rrule_str: Optional[str] = None
-        try:
-            old_rrule_prop = comp.get("rrule")
-            if old_rrule_prop is not None:
-                if hasattr(old_rrule_prop, "to_ical"):
-                    raw = old_rrule_prop.to_ical()
-                    if isinstance(raw, bytes):
-                        raw = raw.decode()
-                    old_rrule_str = str(raw).strip()
-                else:
-                    old_rrule_str = str(old_rrule_prop).strip()
-        except Exception:
-            old_rrule_str = None
+        if summary is not None:
+            _set_text(master, "SUMMARY", summary)
+        if description is not None:
+            _set_text(master, "DESCRIPTION", description)
+        if location is not None:
+            _set_text(master, "LOCATION", location)
 
-        new_summary = summary if summary is not None else old_summary
-        new_desc    = description if description is not None else old_desc
-        new_loc     = location if location is not None else old_loc
-        new_start   = _parse_iso_or_default(start, old_dtstart)
-        new_end_fallback = old_dtend if old_dtend is not None else (new_start + dt.timedelta(hours=1))
-        new_end     = _parse_iso_or_default(end, new_end_fallback)
+        if start is not None or end is not None:
+            _reschedule(ical, master, start, end, tzid)
 
-        # Normalize updated times into the requested/default TZID
-        new_start = _normalize_to_tz(new_start, tzid)
-        new_end = _normalize_to_tz(new_end, tzid)
-
-        # Decide final RRULE
         if clear_recurrence:
-            effective_rrule: Optional[str] = None
+            for name in ("RRULE", "RDATE", "EXDATE"):
+                master.pop(name, None)
+            _drop_overrides(ical, uid)
         elif recurrence is not None:
-            effective_rrule = _build_rrule(recurrence, tzid=tzid, dtstart=new_start)
-        else:
-            effective_rrule = old_rrule_str
+            rrule = _require_rrule(recurrence, tzid=tzid, dtstart=master.decoded("DTSTART"))
+            master.pop("RRULE", None)
+            master.add("RRULE", vRecur.from_ical(rrule))
 
-        ics_text = _build_vevent_ics(
-            uid=uid,
-            summary=new_summary,
-            start=new_start,
-            end=new_end,
-            tzid=tzid,
-            description=new_desc,
-            location=new_loc,
-            rrule=effective_rrule,
-            include_location=new_loc is not None and new_loc != "",
-        )
-
-        target.data = ics_text
-        target.save()
+        _touch(master)
+        _save(target, ical)
         return True
 
     @mcp.tool()
-    def delete_event(calendar_name_or_url: str, uid: str) -> bool:
+    def delete_event(
+        calendar_name_or_url: str,
+        uid: str,
+        occurrence_start: Optional[str] = None,
+    ) -> bool:
         """
-        Delete a VEVENT by UID from the given calendar.
+        Delete an event by UID from the given calendar.
+
+        occurrence_start: for a recurring event, the start of the one
+        occurrence to delete, as list_events returned it; the rest of the
+        series is kept. Omit to delete the whole event or series.
         Returns True if deleted, else False (not found).
         """
         cal = _resolve_calendar(calendar_name_or_url)
+        target = _find_event(cal, uid)
+        if target is None:
+            return False
 
-        start, end = _uid_search_window()
+        if occurrence_start is None:
+            target.delete()
+            return True
 
-        for ev in cal.search(event=True, start=start, end=end, expand=False):
-            comp = ev.component
-            if str(comp.get("uid", "")) == uid:
-                ev.delete()
-                return True
-        return False
+        wanted = _parse_when(occurrence_start)
+        if not _is_all_day(wanted):
+            wanted = _normalize_to_tz(wanted, DEFAULT_TZID)
+
+        ical = ICalendar.from_ical(target.data)
+        master = _master_vevent(ical, uid)
+        recurrence_id = _find_occurrence(ical, uid, wanted)
+        if recurrence_id is None:
+            return False
+
+        if master.get("RRULE") is None and master.get("RDATE") is None:
+            target.delete()  # not recurring: the occurrence is the event
+            return True
+
+        _drop_overrides(ical, uid, recurrence_id)
+        master.add("EXDATE", _same_kind(master.decoded("DTSTART"), recurrence_id))
+        _touch(master)
+        _save(target, ical)
+        return True
 
 # Main
 
 if __name__ == "__main__":
-    log.info("Starting MCP HTTP server on %s:%s", SERVER_HOST, SERVER_PORT)
+    parser = argparse.ArgumentParser(description="iCloud CalDAV MCP server")
+    parser.add_argument(
+        "--transport",
+        choices=["http", "stdio"],
+        default=os.environ.get("MCP_TRANSPORT", "http"),
+        help="http serves HOST:PORT/mcp; stdio is for local clients such as Claude Code/Desktop",
+    )
+    args = parser.parse_args()
+
     log.info("CalDAV: %s  Apple ID: %r  TZ: %s  DR_ONLY=%s", CALDAV_URL, APPLE_ID, DEFAULT_TZID, DR_ONLY)
-    mcp.run(transport="http", host=SERVER_HOST, port=SERVER_PORT, path="/mcp")
+    if args.transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        log.info("Starting MCP HTTP server on %s:%s", SERVER_HOST, SERVER_PORT)
+        mcp.run(transport="http", host=SERVER_HOST, port=SERVER_PORT, path="/mcp")

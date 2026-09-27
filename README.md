@@ -1,8 +1,8 @@
 # iCloud CalDAV MCP Connector
 
-An HTTP **Model Context Protocol (MCP)** server exposing iCloud Calendar (CalDAV) tools so MCP-aware clients (e.g., ChatGPT custom connectors, IDEs) can list calendars, read events, and create/update/delete events using an iCloud **app-specific password**.
+A **Model Context Protocol (MCP)** server (HTTP or stdio) exposing iCloud Calendar (CalDAV) tools so MCP-aware clients (e.g., ChatGPT custom connectors, Claude Code, Claude Desktop) can list calendars, read events, and create/update/delete events using an iCloud **app-specific password**.
 
-> Unofficial. Calendar only. Keep this service private; it forwards your iCloud app-specific password to Apple’s CalDAV endpoint.
+> Unofficial. Calendar only. Keep this service private; it forwards your iCloud app-specific password to Apple's CalDAV endpoint.
 
 ---
 
@@ -14,19 +14,20 @@ I built this to use in ChatGPT Custom Connector, so I can change my iCloud Calen
 
 ## Features
 
-- HTTP MCP server (`/mcp`) + `GET /health`
+- HTTP MCP server (`/mcp`) + `GET /health`, or stdio for local clients (`--transport stdio`)
 - Tools (default write-capable profile):
   - `list_calendars()`
   - `list_calendars_with_events(start, end, expand_recurring=True)`
-  - `list_events(calendar_name_or_url, start, end, expand_recurring=True)`
+  - `list_events(start, end, calendar_name_or_url?, expand_recurring=True, query?, include_raw=False)`
   - `create_event(calendar_name_or_url, summary, start, end, tzid?, description?, location?, recurrence?)`
   - `update_event(calendar_name_or_url, uid, summary?, start?, end?, tzid?, description?, location?, recurrence?, clear_recurrence=False)`
-  - `delete_event(calendar_name_or_url, uid)`
+  - `delete_event(calendar_name_or_url, uid, occurrence_start?)`
 - Tools (Deep Research read-only profile):
-  - `search(query)` → basic text search over SUMMARY/DESCRIPTION in a time window
-  - `fetch(ids)` → fetch raw `text/calendar` ICS blobs for search results
-- ISO datetime input (`YYYY-MM-DDTHH:MM:SS`, with optional `Z` or timezone offset)
-- Minimal ICS generation (summary/description escaping), UID matching across a ±3-year window
+  - `search(query)` -> basic text search over SUMMARY/DESCRIPTION in a time window
+  - `fetch(ids)` -> fetch raw `text/calendar` ICS blobs for search results
+- ISO datetime input (`YYYY-MM-DDTHH:MM:SS`, with optional `Z` or timezone offset); bare dates for all-day events
+- Updates edit the stored event in place, so alarms, attendees and recurrence exceptions survive
+- Server-side UID lookup (falls back to a +/-3-year scan if the server rejects it)
 
 ---
 
@@ -77,6 +78,33 @@ curl http://127.0.0.1:8000/health   # OK
 
 ---
 
+## Use with Claude Code / Claude Desktop (stdio)
+
+Local clients can launch the server on demand over stdio, so nothing has to stay running. The `.env` next to `server.py` is still used for credentials.
+
+Claude Code:
+
+```bash
+claude mcp add -s user icloud-calendar -- /path/to/icloud-mcp/.venv/bin/python /path/to/icloud-mcp/server.py --transport stdio
+```
+
+Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json`), then restart Claude:
+
+```json
+{
+  "mcpServers": {
+    "icloud-calendar": {
+      "command": "/path/to/icloud-mcp/.venv/bin/python",
+      "args": ["/path/to/icloud-mcp/server.py", "--transport", "stdio"]
+    }
+  }
+}
+```
+
+`MCP_TRANSPORT=stdio` in the environment does the same as `--transport stdio`.
+
+---
+
 ## Tool Reference (functional details)
 
 ### `list_calendars() -> List[Calendar]`
@@ -94,32 +122,40 @@ given time window.
 
 **Args**
 
-- `start, end: str` — ISO datetimes; search is [**start**, **end**)
-- `expand_recurring: bool` — treat recurring series as concrete instances
+- `start, end: str`: ISO datetimes; search is [**start**, **end**)
+- `expand_recurring: bool`: treat recurring series as concrete instances
 
 Each returned calendar has the same shape as `list_calendars()`.
 
-### `list_events(calendar_name_or_url, start, end, expand_recurring=True) -> List[Event]`
+### `list_events(start, end, calendar_name_or_url?, expand_recurring=True, query?, include_raw=False) -> List[Event]`
 
 **Args**
 
-- `calendar_name_or_url: str` — display name or full CalDAV URL
-- `start, end: str` — ISO datetimes; search is [**start**, **end**)
-- `expand_recurring: bool` — include concrete instances of recurring series
+- `start, end: str`: ISO datetimes; search is [**start**, **end**) (naive times are in `TZID`)
+- `calendar_name_or_url: str | null`: display name or full CalDAV URL; omit to search **all** calendars
+- `expand_recurring: bool`: include concrete instances of recurring series
+- `query: str | null`: case-insensitive filter on summary, location and description
+- `include_raw: bool`: also return the ICS text (large; off by default)
 
-**Returns** each event with:
+**Returns** events sorted by start, each with:
 
-- `uid: str`
+- `uid: str` (shared by every occurrence of a recurring series)
 - `summary: str`
-- `start: str` (ISO)
-- `end: str | null` (ISO)
-- `raw: str` (original ICS text)
+- `start: str`, `end: str | null`: ISO, expressed in `TZID`; date-only for all-day events (end exclusive)
+- `all_day: bool`
+- `location: str | null`
+- `description: str | null` (first 500 characters)
+- `calendar: str` (display name)
+- `recurring: bool`
+- `raw: str` (only with `include_raw=true`)
 
 ### `create_event(calendar_name_or_url, summary, start, end, tzid?, description?, location?, recurrence?) -> str`
 
-Creates a minimal **VEVENT**.
+Creates a **VEVENT**.
 
-- `tzid` defaults to `TZID` env if omitted; naive datetimes are assumed in that zone and stored as UTC.
+- `start`/`end` as dates (`YYYY-MM-DD`) create an all-day event; `end` is exclusive (a single day is `D` to `D+1`; `end == start` is treated as one day).
+- `tzid` defaults to `TZID` env if omitted; naive datetimes are assumed in that zone (stored as `DTSTART;TZID=...`).
+- An unrecognized `recurrence` is rejected rather than silently ignored.
 - `description` is optional; omit or pass `null` to skip it.
 - `location` is optional; omit or pass `null` to skip it.
 - `recurrence` (optional) describes how the event should repeat, for example:
@@ -141,35 +177,43 @@ Creates a minimal **VEVENT**.
     }
     ```
 
-- Returns the generated `uid` (random hex + `@chatgpt-mcp`).
+- Returns the generated `uid` (random hex + `@icloud-mcp`).
 
 ### `update_event(calendar_name_or_url, uid, summary?, start?, end?, tzid?, description?, location?, recurrence?, clear_recurrence=False) -> bool`
 
 Updates the **whole** event identified by `uid` (for recurring events this updates the series VEVENT, not a single instance).
 
-- Preserves any omitted fields from the original component.
+- Edits the stored event in place: anything not passed (alarms, attendees, URL, EXDATEs, moved occurrences, ...) is kept.
+- `start`/`end`:
+  - Only `start` given: the event keeps its duration.
+  - Dates (`YYYY-MM-DD`) make it all-day; datetimes make it timed.
+  - Moving a recurring series' start shifts its EXDATEs and moved occurrences by the same amount so they stay attached.
+- `description`: omit to keep, `""` to clear.
 - `location`:
   - If omitted (`null` / not provided), keeps the existing location.
-  - If provided as a non-empty string, updates the event’s location.
-  - If provided as an empty string, clears the event’s location.
+  - If provided as a non-empty string, updates the event's location.
+  - If provided as an empty string, clears the event's location.
 - `recurrence`:
   - If provided, replaces any existing RRULE using the same shape as in `create_event`.
 - `clear_recurrence`:
-  - If `True`, removes any RRULE and converts the event back to a single non-recurring instance.
+  - If `True`, removes any RRULE/RDATE/EXDATE and moved occurrences, converting the event back to a single non-recurring instance.
   - If `True` and `recurrence` is also provided, `clear_recurrence` wins (no recurrence).
-- Returns `True` on success, `False` if `uid` not found in ±3-year window.
+- Returns `True` on success, `False` if `uid` is not in that calendar.
 
-### `delete_event(calendar_name_or_url, uid) -> bool`
+### `delete_event(calendar_name_or_url, uid, occurrence_start?) -> bool`
 
-Deletes the first matching `uid` in a ±3-year window.
+Deletes the event with `uid`.
 
-- Returns `True` if deleted, `False` if not found.
+- Without `occurrence_start`: deletes the whole event (the entire series if recurring).
+- With `occurrence_start` (the `start` that `list_events` returned for that occurrence, or just its date): deletes only that occurrence by adding an EXDATE (and dropping its override if it had been moved). The rest of the series stays.
+- Returns `True` if deleted, `False` if the event or occurrence is not found.
 
 **Date/Time Notes**
 
 - Accepts naive or `Z`/offset datetimes (`YYYY-MM-DDTHH:MM:SS`, optionally `Z` or `-04:00` etc.)
-- New/edited events emit `DTSTART;TZID=...` and `DTEND;TZID=...` using provided `tzid` or `TZID` env
-- Updates attempt to reuse the original TZID when present
+- `YYYY-MM-DD` means an all-day event (create/update) or a whole day (`occurrence_start`)
+- New/rescheduled events emit `DTSTART;TZID=...` and `DTEND;TZID=...` using provided `tzid` or `TZID` env
+- Updates leave `DTSTART`/`DTEND` (and their TZID) untouched unless `start`/`end` are passed
 - `LOCATION` is emitted when `location` is provided and non-empty; passing an empty string when updating an event removes the existing location.
 
 ---
@@ -190,7 +234,7 @@ DR_PROFILE=1 HOST=127.0.0.1 PORT=8000 python server.py
 Notes:
 
 - Write tools (list_events/create_event/update_event/delete_event) are disabled in this mode.
-- SCAN_DAYS controls the search window around “now” (default: 1095 days ≈ 3 years).
+- SCAN_DAYS controls the search window around "now" (default: 1095 days ~ 3 years).
 - Keep this service private or add auth
 
 ---
@@ -259,7 +303,7 @@ You need a public HTTPS URL that forwards to your local `http://127.0.0.1:8000`.
 | -------------------- | --------------------------------------------------------------------------------- |
 | `401 Unauthorized`   | Wrong Apple ID or app-specific password; ensure `.env` uses **email**, not phone. |
 | Empty event results  | Wrong calendar URL or time window; remember `end` is exclusive.                   |
-| Update/Delete no-ops | UID not in ±3-year scan window or different calendar than you’re querying.        |
+| Update/Delete no-ops | UID belongs to a different calendar than the one you passed.                      |
 | Timezone drift       | Pass `tzid` explicitly (e.g., `America/New_York`) or use UTC `...Z`.              |
 
 ---
@@ -268,7 +312,7 @@ You need a public HTTPS URL that forwards to your local `http://127.0.0.1:8000`.
 
 - Use **app-specific passwords** and rotate as needed
 - Keep this server private (tunnel ACLs, IP allowlists, auth proxy)
-- This project rewrites minimal VEVENTs; advanced fields (attendees, alarms, recurrence exceptions) are not preserved on update
+- Updates edit the stored event in place; the server only changes the fields you pass (plus DTSTAMP/LAST-MODIFIED)
 
 ---
 
