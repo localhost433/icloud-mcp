@@ -9,6 +9,7 @@ import logging
 import datetime as dt
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Union
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import recurring_ical_events
@@ -101,15 +102,24 @@ def _resolve_calendar(name_or_url: str):
 def _find_event(calendar, uid: str):
     """Return the object holding ``uid`` in ``calendar``, or None.
 
-    Falls back to scanning LOOKBACK_YEARS either side of today if the
-    server rejects the UID query.
+    Tries ``<calendar>/<uid>.ics`` first (where iCloud and caldav store
+    most events), then a UID query, then a scan of LOOKBACK_YEARS either
+    side of today for servers that reject the query (iCloud does).
     """
+    href = calendar.url.join(quote(uid.replace("/", "%2F")) + ".ics")
+    try:
+        ev = calendar.event_by_url(href)
+        if str(ev.component.get("uid", "")) == uid:
+            return ev
+    except dav_error.DAVError:
+        pass
+
     try:
         return calendar.event_by_uid(uid)
     except dav_error.NotFoundError:
         return None
     except dav_error.DAVError as exc:
-        log.warning("UID lookup failed on %s (%s); scanning instead", _cal_name(calendar), exc)
+        log.info("UID query rejected by %s (%s); scanning instead", _cal_name(calendar), exc)
 
     start, end = _uid_search_window()
     for ev in calendar.search(event=True, start=start, end=end, expand=False):

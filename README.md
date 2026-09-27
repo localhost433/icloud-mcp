@@ -27,7 +27,7 @@ I built this to use in ChatGPT Custom Connector, so I can change my iCloud Calen
   - `fetch(ids)` -> fetch raw `text/calendar` ICS blobs for search results
 - ISO datetime input (`YYYY-MM-DDTHH:MM:SS`, with optional `Z` or timezone offset); bare dates for all-day events
 - Updates edit the stored event in place, so alarms, attendees and recurrence exceptions survive
-- Server-side UID lookup (falls back to a +/-3-year scan if the server rejects it)
+- Finds events by their `<uid>.ics` URL, then by UID query, then by a +/-3-year scan (iCloud rejects UID queries)
 
 ---
 
