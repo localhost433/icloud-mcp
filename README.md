@@ -19,8 +19,8 @@ I built this to use in ChatGPT Custom Connector, so I can change my iCloud Calen
   - `list_calendars()`
   - `list_calendars_with_events(start, end, expand_recurring=True)`
   - `list_events(start, end, calendar_name_or_url?, expand_recurring=True, query?, include_raw=False)`
-  - `create_event(calendar_name_or_url, summary, start, end, tzid?, description?, location?, recurrence?)`
-  - `update_event(calendar_name_or_url, uid, summary?, start?, end?, tzid?, description?, location?, recurrence?, clear_recurrence=False)`
+  - `create_event(calendar_name_or_url, summary, start, end, tzid?, description?, location?, recurrence?, alarms?)`
+  - `update_event(calendar_name_or_url, uid, summary?, start?, end?, tzid?, description?, location?, recurrence?, clear_recurrence=False, alarms?)`
   - `delete_event(calendar_name_or_url, uid, occurrence_start?)`
 - Tools (Deep Research read-only profile):
   - `search(query)` -> basic text search over SUMMARY/DESCRIPTION in a time window
@@ -51,6 +51,7 @@ CALDAV_URL=https://caldav.icloud.com     # optional, default shown
 HOST=127.0.0.1                           # optional
 PORT=8000                                # optional
 TZID=America/New_York                    # default TZ for new/edited events
+MCP_AUTH_TOKEN=                          # HTTP mode: required header X-Auth-Token or Authorization: Bearer (unset = no auth)
 
 # Deep Research: read-only profile (optional)
 DR_PROFILE=0                             # Set to 1 to enable DR mode (default 0)
@@ -147,9 +148,10 @@ Each returned calendar has the same shape as `list_calendars()`.
 - `description: str | null` (first 500 characters)
 - `calendar: str` (display name)
 - `recurring: bool`
+- `alarms: int[]`: alerts as minutes before start (absolute-time alerts are not listed)
 - `raw: str` (only with `include_raw=true`)
 
-### `create_event(calendar_name_or_url, summary, start, end, tzid?, description?, location?, recurrence?) -> str`
+### `create_event(calendar_name_or_url, summary, start, end, tzid?, description?, location?, recurrence?, alarms?) -> str`
 
 Creates a **VEVENT**.
 
@@ -158,6 +160,7 @@ Creates a **VEVENT**.
 - An unrecognized `recurrence` is rejected rather than silently ignored.
 - `description` is optional; omit or pass `null` to skip it.
 - `location` is optional; omit or pass `null` to skip it.
+- `alarms` (optional): alerts as minutes before start, e.g. `[15, 60]`; `0` is at the start. For all-day events they count back from midnight, so `900` is 9:00 the day before.
 - `recurrence` (optional) describes how the event should repeat, for example:
 
     ```jsonc
@@ -179,7 +182,7 @@ Creates a **VEVENT**.
 
 - Returns the generated `uid` (random hex + `@icloud-mcp`).
 
-### `update_event(calendar_name_or_url, uid, summary?, start?, end?, tzid?, description?, location?, recurrence?, clear_recurrence=False) -> bool`
+### `update_event(calendar_name_or_url, uid, summary?, start?, end?, tzid?, description?, location?, recurrence?, clear_recurrence=False, alarms?) -> bool`
 
 Updates the **whole** event identified by `uid` (for recurring events this updates the series VEVENT, not a single instance).
 
@@ -198,6 +201,7 @@ Updates the **whole** event identified by `uid` (for recurring events this updat
 - `clear_recurrence`:
   - If `True`, removes any RRULE/RDATE/EXDATE and moved occurrences, converting the event back to a single non-recurring instance.
   - If `True` and `recurrence` is also provided, `clear_recurrence` wins (no recurrence).
+- `alarms`: omit to keep, `[]` to remove all, or a list of minutes (as in `create_event`) to replace the alerts on every occurrence.
 - Returns `True` on success, `False` if `uid` is not in that calendar.
 
 ### `delete_event(calendar_name_or_url, uid, occurrence_start?) -> bool`

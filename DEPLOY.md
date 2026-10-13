@@ -6,6 +6,7 @@ The MCP server listens on `HOST:PORT` (default `0.0.0.0:8000`) and serves:
 - Health check: `GET /health`
 
 > Keep this private or fronted by auth; it has write access to your iCloud Calendar.
+> Set `MCP_AUTH_TOKEN` (shell or `.env`) to require a token on every route except `/health`; without it the server logs a warning when `HOST` is not loopback.
 
 ## Cloudflare Tunnel
 
@@ -72,6 +73,8 @@ Configure your MCP client / ChatGPT custom connector to send:
 - Header: `X-Auth-Token`
 - Value: `<same value as MCP_AUTH_TOKEN>`
 
+`Authorization: Bearer <MCP_AUTH_TOKEN>` is accepted too, for clients that only send bearer tokens. Requests without a matching token get `401`.
+
 ## VPS + Caddy (auto-TLS) or Nginx (manual TLS)
 
 On a remote box running your server on `0.0.0.0:8000`, add a reverse proxy:
@@ -104,6 +107,7 @@ docker run --rm \
   -p 8000:8000 \
   -e APPLE_ID=you@example.com \
   -e ICLOUD_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx \
+  -e MCP_AUTH_TOKEN=<random secret> \
   -e DR_PROFILE=1 \
   -e SCAN_DAYS=1095 \
   icloud-mcp

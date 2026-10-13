@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import hmac
 import argparse
 import logging
 import datetime as dt
@@ -15,7 +16,8 @@ from zoneinfo import ZoneInfo
 import recurring_ical_events
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-from icalendar import Calendar as ICalendar, Event as IEvent, vRecur
+from icalendar import Alarm, Calendar as ICalendar, Event as IEvent, vRecur
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
@@ -44,6 +46,8 @@ LOOKBACK_YEARS = 3  # for UID searches
 DESCRIPTION_LIMIT = 500  # chars of DESCRIPTION returned by list_events
 SERVER_HOST = os.environ.get("HOST", "127.0.0.1")
 SERVER_PORT = int(os.environ.get("PORT", "8000"))
+# Shared secret for HTTP mode; clients send it as X-Auth-Token or Authorization: Bearer.
+AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "").strip()
 
 # Deep Research (read-only) profile
 DR_ONLY = os.environ.get("DR_PROFILE", "0") == "1"
@@ -64,6 +68,29 @@ mcp = FastMCP("icloud-caldav")
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_: Request) -> PlainTextResponse:
     return PlainTextResponse("OK")
+
+
+class _TokenAuth:
+    """ASGI middleware: reject HTTP requests without AUTH_TOKEN, except /health."""
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self.token = token.encode()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"] != "/health" and not self._authorized(scope):
+            await PlainTextResponse("Unauthorized", status_code=401)(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+    def _authorized(self, scope) -> bool:
+        headers = dict(scope["headers"])
+        supplied = headers.get(b"x-auth-token")
+        if supplied is None:
+            auth = headers.get(b"authorization", b"")
+            if auth[:7].lower() == b"bearer ":
+                supplied = auth[7:]
+        return supplied is not None and hmac.compare_digest(supplied.strip(), self.token)
 
 # CalDAV helpers
 
@@ -270,10 +297,37 @@ def _event_row(comp, calendar_name: str, raw: Optional[str] = None) -> Dict[str,
         "description": description or None,
         "calendar": calendar_name,
         "recurring": comp.get("RECURRENCE-ID") is not None or comp.get("RRULE") is not None,
+        "alarms": _alarm_minutes(comp),
     }
     if raw is not None:
         row["raw"] = raw
     return row
+
+
+def _alarm_minutes(comp) -> List[int]:
+    """Minutes before start of each alert timed relative to the start (absolute ones are skipped)."""
+    out = []
+    for alarm in comp.walk("VALARM"):
+        trigger = alarm.get("TRIGGER")
+        if trigger is None or _text(alarm, "ACTION").upper() == "NONE":
+            continue
+        if trigger.params.get("RELATED", "START").upper() != "START" or not isinstance(trigger.dt, dt.timedelta):
+            continue
+        out.append(round(-trigger.dt.total_seconds() / 60))
+    return sorted(out)
+
+
+def _set_alarms(comp, minutes_before: List[int]) -> None:
+    """Replace the component's alerts with one display alert per entry (minutes before start)."""
+    if any(m < 0 for m in minutes_before):
+        raise ValueError("alarms are minutes before the start and must be >= 0")
+    comp.subcomponents[:] = [c for c in comp.subcomponents if c.name != "VALARM"]
+    for minutes in sorted(set(minutes_before)):
+        alarm = Alarm()
+        alarm.add("ACTION", "DISPLAY")
+        alarm.add("DESCRIPTION", _text(comp, "SUMMARY") or "Reminder")
+        alarm.add("TRIGGER", dt.timedelta(minutes=-minutes))
+        comp.add_component(alarm)
 
 
 def _master_vevent(ical, uid: str):
@@ -382,6 +436,7 @@ def _build_vevent_ics(
     description: Optional[str],
     location: Optional[str],
     rrule: Optional[str],
+    alarms: Optional[List[int]] = None,
 ) -> str:
     """Build a single-VEVENT ICS blob. Date start/end produce an all-day event."""
     event = IEvent()
@@ -396,6 +451,8 @@ def _build_vevent_ics(
         event.add("DESCRIPTION", description)
     if rrule:
         event.add("RRULE", vRecur.from_ical(rrule))
+    if alarms:
+        _set_alarms(event, alarms)
 
     cal = ICalendar()
     cal.add("PRODID", "-//icloud-mcp//EN")
@@ -705,6 +762,7 @@ if not DR_ONLY:
         description: Optional[str] = None,
         location: Optional[str] = None,
         recurrence: Optional[Dict[str, Any]] = None,
+        alarms: Optional[List[int]] = None,
     ) -> str:
         """
         Create an event in the given calendar.
@@ -713,6 +771,9 @@ if not DR_ONLY:
                   event pass dates ('YYYY-MM-DD'); end is exclusive, so a
                   single day is start=D, end=D+1.
         tzid:     IANA TZ name (e.g., 'America/New_York'); used if times are naive.
+        alarms:   alerts as minutes before start, e.g. [15, 60]; 0 is at the
+                  start. For all-day events they count back from midnight, so
+                  900 is 9:00 the day before.
         recurrence: optional dict, e.g.:
 
           {
@@ -748,6 +809,7 @@ if not DR_ONLY:
             description=description,
             location=location,
             rrule=rrule,
+            alarms=alarms,
         )
 
         cal.save_event(ics_text)
@@ -765,6 +827,7 @@ if not DR_ONLY:
         location: Optional[str] = None,
         recurrence: Optional[Dict[str, Any]] = None,
         clear_recurrence: bool = False,
+        alarms: Optional[List[int]] = None,
     ) -> bool:
         """
         Update the event identified by UID. Edits it in place, so alarms,
@@ -777,6 +840,8 @@ if not DR_ONLY:
         - recurrence replaces the RRULE (same shape as create_event).
         - clear_recurrence=True removes the RRULE and all exceptions; it wins
           over recurrence.
+        - alarms: omit to keep, [] to remove all, or minutes before start
+          (same as create_event) to replace them on every occurrence.
         Returns False if the UID is not found.
         """
         tzid = tzid or DEFAULT_TZID
@@ -807,6 +872,11 @@ if not DR_ONLY:
             rrule = _require_rrule(recurrence, tzid=tzid, dtstart=master.decoded("DTSTART"))
             master.pop("RRULE", None)
             master.add("RRULE", vRecur.from_ical(rrule))
+
+        if alarms is not None:
+            for comp in ical.walk("VEVENT"):
+                if _text(comp, "UID") == uid:
+                    _set_alarms(comp, alarms)
 
         _touch(master)
         _save(target, ical)
@@ -871,5 +941,11 @@ if __name__ == "__main__":
     if args.transport == "stdio":
         mcp.run(transport="stdio")
     else:
-        log.info("Starting MCP HTTP server on %s:%s", SERVER_HOST, SERVER_PORT)
-        mcp.run(transport="http", host=SERVER_HOST, port=SERVER_PORT, path="/mcp")
+        if AUTH_TOKEN:
+            middleware = [Middleware(_TokenAuth, token=AUTH_TOKEN)]
+        else:
+            middleware = []
+            if SERVER_HOST not in ("127.0.0.1", "localhost", "::1"):
+                log.warning("MCP_AUTH_TOKEN is not set: anyone who can reach %s:%s can use /mcp", SERVER_HOST, SERVER_PORT)
+        log.info("Starting MCP HTTP server on %s:%s (auth %s)", SERVER_HOST, SERVER_PORT, "on" if AUTH_TOKEN else "off")
+        mcp.run(transport="http", host=SERVER_HOST, port=SERVER_PORT, path="/mcp", middleware=middleware)
